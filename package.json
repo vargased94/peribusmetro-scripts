@@ -1,0 +1,26 @@
+{
+  "name": "peribus-scripts",
+  "version": "1.0.0",
+  "description": "Scripts de automatización, ETL y backup para el ecosistema Peribus Metropolitano.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "sync:incremental:dev": "DOTENV_CONFIG_PATH=.env.development node --env-file=.env.development scripts/sync-incremental.mjs",
+    "sync:incremental:prod": "DOTENV_CONFIG_PATH=.env.production node --env-file=.env.production scripts/sync-incremental.mjs",
+    "sync:extra:dev": "DOTENV_CONFIG_PATH=.env.development node --env-file=.env.development scripts/sync-update-extra-fields.mjs",
+    "sync:extra:prod": "DOTENV_CONFIG_PATH=.env.production node --env-file=.env.production scripts/sync-update-extra-fields.mjs",
+    "autolink:dev": "DOTENV_CONFIG_PATH=.env.development node --env-file=.env.development scripts/comercial-auto-link.mjs",
+    "autolink:prod": "DOTENV_CONFIG_PATH=.env.production node --env-file=.env.production scripts/comercial-auto-link.mjs",
+    "backup:prod-to-dev": "./scripts/backup-prod-to-dev.sh"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "mssql": "^11.0.1",
+    "postgres": "^3.4.5"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "author": "Eduardo Vargas",
+  "license": "UNLICENSED"
+}

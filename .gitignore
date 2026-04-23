@@ -1,0 +1,26 @@
+node_modules/
+
+# Archivos de entorno — nunca commitear
+.env
+.env.*
+!.env.example
+
+# Backups generados localmente
+backups/
+*.dump
+*.csv.gz
+
+# Logs
+*.log
+/tmp/
+
+# macOS / editores
+.DS_Store
+.vscode/
+.idea/
+
+# package managers
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*

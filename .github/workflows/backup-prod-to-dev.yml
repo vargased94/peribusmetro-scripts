@@ -1,0 +1,285 @@
+name: "Backup PROD → DEV"
+
+# Durante la fase de validación, solo ejecución manual.
+# Cuando se apruebe, descomentar el bloque schedule.
+on:
+  # schedule:
+  #   - cron: "0 8 * * *"  # Diario 02:00 AM hora de México (CST/UTC-6 = 08:00 UTC)
+  workflow_dispatch:
+    inputs:
+      skip_restore:
+        description: "Solo generar backup sin restaurar en DEV"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+env:
+  FROM_EMAIL: "Peribus Metropolitano <admin@peribusmetro.mx>"
+  # Fecha mínima para income_transactions (formato YYYY-MM-DD).
+  INCOME_TRANSACTIONS_MIN_DATE: "2026-01-01"
+
+jobs:
+  backup-and-restore:
+    name: Backup PROD → Restore DEV
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Set backup filename
+        run: |
+          TIMESTAMP=$(date -u +"%Y%m%d_%H%M%S")
+          FECHA=$(TZ="America/Mexico_City" date +"%d/%m/%Y %H:%M:%S")
+          echo "BACKUP_FILE=main_${TIMESTAMP}.dump" >> $GITHUB_ENV
+          echo "BACKUP_FILE_LARGE=income_transactions_${TIMESTAMP}.csv.gz" >> $GITHUB_ENV
+          echo "TIMESTAMP=${TIMESTAMP}" >> $GITHUB_ENV
+          echo "FECHA_MX=${FECHA}" >> $GITHUB_ENV
+
+      # ── DUMP ──
+
+      - name: "Dump PROD: schema + datos (sin income_transactions)"
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
+        run: |
+          echo "::group::pg_dump principal (excluyendo datos de income_transactions)..."
+          pg_dump "$DATABASE_URL" \
+            --schema=public \
+            --format=custom \
+            --compress=1 \
+            --no-owner \
+            --no-privileges \
+            --exclude-table-data=income_transactions \
+            --file="${BACKUP_FILE}"
+          echo "::endgroup::"
+
+          FILE_SIZE=$(du -h "$BACKUP_FILE" | cut -f1)
+          echo "Dump principal completado: ${FILE_SIZE}"
+          echo "BACKUP_SIZE_MAIN=${FILE_SIZE}" >> $GITHUB_ENV
+
+      - name: "Dump PROD: income_transactions (CSV filtrado)"
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
+        run: |
+          echo "::group::COPY income_transactions (transaction_date >= ${INCOME_TRANSACTIONS_MIN_DATE})..."
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+            -c "\COPY (SELECT * FROM income_transactions WHERE transaction_date >= '${INCOME_TRANSACTIONS_MIN_DATE}') TO STDOUT WITH (FORMAT csv, HEADER true)" \
+            | gzip -1 > "${BACKUP_FILE_LARGE}"
+          echo "::endgroup::"
+
+          FILE_SIZE=$(du -h "$BACKUP_FILE_LARGE" | cut -f1)
+          ROWS=$(gunzip -c "${BACKUP_FILE_LARGE}" | tail -n +2 | wc -l | tr -d ' ')
+          echo "Dump income_transactions completado: ${FILE_SIZE} (${ROWS} filas)"
+          echo "BACKUP_SIZE_LARGE=${FILE_SIZE}" >> $GITHUB_ENV
+          echo "BACKUP_ROWS_LARGE=${ROWS}" >> $GITHUB_ENV
+          echo "BACKUP_SIZE=${BACKUP_SIZE_MAIN} + ${FILE_SIZE}" >> $GITHUB_ENV
+
+      - name: Upload backup artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: "prod-backup-${{ env.TIMESTAMP }}"
+          path: |
+            ${{ env.BACKUP_FILE }}
+            ${{ env.BACKUP_FILE_LARGE }}
+          retention-days: 7
+
+      # ── RESTORE ──
+
+      - name: "Restore DEV: Limpiar schema"
+        if: ${{ github.event.inputs.skip_restore != 'true' }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_DEV }}
+        run: |
+          echo "::group::Limpiando esquema public en DEV..."
+          psql "$DATABASE_URL" -c "
+            DROP SCHEMA IF EXISTS public CASCADE;
+            CREATE SCHEMA public;
+            GRANT ALL ON SCHEMA public TO postgres;
+            GRANT ALL ON SCHEMA public TO public;
+          "
+          echo "::endgroup::"
+
+      - name: "Restore DEV: Fase 1 - Schema (pre-data)"
+        if: ${{ github.event.inputs.skip_restore != 'true' }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_DEV }}
+        run: |
+          echo "::group::Restaurando estructura..."
+          pg_restore \
+            -d "$DATABASE_URL" \
+            --format=custom \
+            --no-owner \
+            --no-privileges \
+            --section=pre-data \
+            "${BACKUP_FILE}" 2>&1 || {
+              echo "::warning::pg_restore pre-data terminó con advertencias"
+            }
+          echo "::endgroup::"
+
+      - name: "Restore DEV: Fase 2 - Datos (sin income_transactions)"
+        if: ${{ github.event.inputs.skip_restore != 'true' }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_DEV }}
+        run: |
+          echo "::group::Restaurando datos..."
+          pg_restore \
+            -d "$DATABASE_URL" \
+            --format=custom \
+            --no-owner \
+            --no-privileges \
+            --jobs=4 \
+            --section=data \
+            "${BACKUP_FILE}" 2>&1 || {
+              echo "::warning::pg_restore data terminó con advertencias"
+            }
+          echo "::endgroup::"
+
+      - name: "Restore DEV: Fase 3 - income_transactions (CSV filtrado)"
+        if: ${{ github.event.inputs.skip_restore != 'true' }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_DEV }}
+        run: |
+          echo "::group::Restaurando income_transactions desde CSV filtrado..."
+          psql "$DATABASE_URL" -c "ALTER TABLE income_transactions DISABLE TRIGGER ALL;" 2>&1 || true
+
+          gunzip -c "${BACKUP_FILE_LARGE}" \
+            | psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+              -c "\COPY income_transactions FROM STDIN WITH (FORMAT csv, HEADER true)" 2>&1 || {
+                echo "::warning::income_transactions restore falló."
+                echo "INCOME_RESTORE_FAILED=true" >> $GITHUB_ENV
+              }
+
+          psql "$DATABASE_URL" -c "ALTER TABLE income_transactions ENABLE TRIGGER ALL;" 2>&1 || true
+          psql "$DATABASE_URL" -c "SELECT setval(pg_get_serial_sequence('income_transactions', 'id'), COALESCE(MAX(id), 1)) FROM income_transactions;" 2>&1 || true
+          echo "::endgroup::"
+
+      - name: "Restore DEV: Fase 4 - Indexes y constraints (post-data)"
+        if: ${{ github.event.inputs.skip_restore != 'true' }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_DEV }}
+        run: |
+          echo "::group::Restaurando indexes y constraints..."
+          pg_restore \
+            -d "$DATABASE_URL" \
+            --format=custom \
+            --no-owner \
+            --no-privileges \
+            --jobs=4 \
+            --section=post-data \
+            "${BACKUP_FILE}" 2>&1 || {
+              echo "::warning::pg_restore post-data terminó con advertencias"
+            }
+          echo "::endgroup::"
+
+      - name: Verify DEV restore
+        if: ${{ github.event.inputs.skip_restore != 'true' }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_DEV }}
+        run: |
+          VERIFY_RESULT=$(psql "$DATABASE_URL" -t -A -F'|' <<'SQL'
+            SELECT 'tablas', COUNT(*)
+            FROM information_schema.tables
+            WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+            UNION ALL
+            SELECT 'usuarios', COUNT(*) FROM users
+            UNION ALL
+            SELECT 'unidades', COUNT(*) FROM units
+            UNION ALL
+            SELECT 'income_transactions', COUNT(*) FROM income_transactions;
+          SQL
+          )
+          echo "$VERIFY_RESULT"
+
+          TABLAS=$(echo "$VERIFY_RESULT" | grep 'tablas' | cut -d'|' -f2)
+          USUARIOS=$(echo "$VERIFY_RESULT" | grep 'usuarios' | cut -d'|' -f2)
+          UNIDADES=$(echo "$VERIFY_RESULT" | grep 'unidades' | cut -d'|' -f2)
+          INCOME=$(echo "$VERIFY_RESULT" | grep 'income_transactions' | cut -d'|' -f2)
+
+          echo "VERIFY_TABLAS=${TABLAS}" >> $GITHUB_ENV
+          echo "VERIFY_USUARIOS=${USUARIOS}" >> $GITHUB_ENV
+          echo "VERIFY_UNIDADES=${UNIDADES}" >> $GITHUB_ENV
+          echo "VERIFY_INCOME=${INCOME}" >> $GITHUB_ENV
+
+          if [ "${USUARIOS}" = "0" ] || [ -z "${USUARIOS}" ]; then
+            echo "::error::La tabla users está vacía después de la restauración."
+            exit 1
+          fi
+          if [ "${UNIDADES}" = "0" ] || [ -z "${UNIDADES}" ]; then
+            echo "::error::La tabla units está vacía después de la restauración."
+            exit 1
+          fi
+
+          if [ "${INCOME}" = "0" ] || [ -z "${INCOME}" ]; then
+            echo "::warning::La tabla income_transactions está vacía."
+          fi
+
+          echo "Verificación OK: ${USUARIOS} usuarios, ${UNIDADES} unidades, ${INCOME} income_transactions en ${TABLAS} tablas"
+
+      - name: Send success email
+        if: success()
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          NOTIFY_EMAILS: ${{ secrets.BACKUP_NOTIFY_EMAILS }}
+        run: |
+          TO_JSON=$(echo "$NOTIFY_EMAILS" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | awk '{printf "\"%s\",", $0}' | sed 's/,$//')
+
+          RESTORED="Sí"
+          if [ "${{ github.event.inputs.skip_restore }}" = "true" ]; then
+            RESTORED="No (solo backup)"
+          fi
+
+          curl -s -X POST "https://api.resend.com/emails" \
+            -H "Authorization: Bearer ${RESEND_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d @- <<EOF
+          {
+            "from": "${FROM_EMAIL}",
+            "to": [${TO_JSON}],
+            "subject": "✅ Backup PROD → DEV exitoso - ${FECHA_MX}",
+            "html": "<div style='font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;'><div style='background: #16a34a; color: white; padding: 20px; border-radius: 8px 8px 0 0;'><h2 style='margin: 0;'>✅ Backup completado exitosamente</h2></div><div style='padding: 20px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;'><table style='width: 100%; border-collapse: collapse;'><tr><td style='padding: 8px; border-bottom: 1px solid #f3f4f6; font-weight: bold;'>Fecha</td><td style='padding: 8px; border-bottom: 1px solid #f3f4f6;'>${FECHA_MX}</td></tr><tr><td style='padding: 8px; border-bottom: 1px solid #f3f4f6; font-weight: bold;'>Dump principal</td><td style='padding: 8px; border-bottom: 1px solid #f3f4f6;'>${BACKUP_SIZE_MAIN:-N/A}</td></tr><tr><td style='padding: 8px; border-bottom: 1px solid #f3f4f6; font-weight: bold;'>Dump income_transactions</td><td style='padding: 8px; border-bottom: 1px solid #f3f4f6;'>${BACKUP_SIZE_LARGE:-N/A} (${BACKUP_ROWS_LARGE:-N/A} filas, desde ${INCOME_TRANSACTIONS_MIN_DATE})</td></tr><tr><td style='padding: 8px; border-bottom: 1px solid #f3f4f6; font-weight: bold;'>Restaurado en DEV</td><td style='padding: 8px; border-bottom: 1px solid #f3f4f6;'>${RESTORED}</td></tr><tr><td style='padding: 8px; border-bottom: 1px solid #f3f4f6; font-weight: bold;'>Tablas</td><td style='padding: 8px; border-bottom: 1px solid #f3f4f6;'>${VERIFY_TABLAS:-N/A}</td></tr><tr><td style='padding: 8px; border-bottom: 1px solid #f3f4f6; font-weight: bold;'>Usuarios</td><td style='padding: 8px; border-bottom: 1px solid #f3f4f6;'>${VERIFY_USUARIOS:-N/A}</td></tr><tr><td style='padding: 8px; border-bottom: 1px solid #f3f4f6; font-weight: bold;'>Unidades</td><td style='padding: 8px; border-bottom: 1px solid #f3f4f6;'>${VERIFY_UNIDADES:-N/A}</td></tr><tr><td style='padding: 8px; border-bottom: 1px solid #f3f4f6; font-weight: bold;'>Income transactions</td><td style='padding: 8px; border-bottom: 1px solid #f3f4f6;'>${VERIFY_INCOME:-N/A}</td></tr><tr><td style='padding: 8px; font-weight: bold;'>Artefacto</td><td style='padding: 8px;'>Disponible 7 días en GitHub Actions</td></tr></table></div><p style='color: #6b7280; font-size: 12px; margin-top: 16px; text-align: center;'>peribus-scripts — Backup automático</p></div>"
+          }
+          EOF
+
+      - name: Send failure email
+        if: failure()
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          NOTIFY_EMAILS: ${{ secrets.BACKUP_NOTIFY_EMAILS }}
+        run: |
+          TO_JSON=$(echo "$NOTIFY_EMAILS" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | awk '{printf "\"%s\",", $0}' | sed 's/,$//')
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          curl -s -X POST "https://api.resend.com/emails" \
+            -H "Authorization: Bearer ${RESEND_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d @- <<EOF
+          {
+            "from": "${FROM_EMAIL}",
+            "to": [${TO_JSON}],
+            "subject": "❌ ERROR en Backup PROD → DEV - ${FECHA_MX}",
+            "html": "<div style='font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;'><div style='background: #dc2626; color: white; padding: 20px; border-radius: 8px 8px 0 0;'><h2 style='margin: 0;'>❌ Error en el backup</h2></div><div style='padding: 20px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;'><p style='color: #374151;'>El backup diario de <strong>PROD → DEV</strong> ha fallado.</p><table style='width: 100%; border-collapse: collapse;'><tr><td style='padding: 8px; border-bottom: 1px solid #f3f4f6; font-weight: bold;'>Fecha</td><td style='padding: 8px; border-bottom: 1px solid #f3f4f6;'>${FECHA_MX}</td></tr><tr><td style='padding: 8px; font-weight: bold;'>Archivo</td><td style='padding: 8px;'>${BACKUP_FILE:-No generado}</td></tr></table><div style='margin-top: 20px; text-align: center;'><a href='${RUN_URL}' style='display: inline-block; background: #dc2626; color: white; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: bold;'>Ver logs en GitHub Actions</a></div></div><p style='color: #6b7280; font-size: 12px; margin-top: 16px; text-align: center;'>peribus-scripts — Backup automático</p></div>"
+          }
+          EOF
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "### ✅ Backup PROD → DEV completado" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ❌ Backup PROD → DEV falló" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Detalle | Valor |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Fecha | ${{ env.FECHA_MX }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Archivo | \`${{ env.BACKUP_FILE }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tamaño | ${{ env.BACKUP_SIZE }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Restaurado en DEV | ${{ github.event.inputs.skip_restore != 'true' && 'Sí' || 'No (skip_restore)' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Artefacto | Retención 7 días |" >> $GITHUB_STEP_SUMMARY

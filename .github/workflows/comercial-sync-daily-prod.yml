@@ -1,0 +1,210 @@
+name: "Comercial Sync Daily (PROD)"
+
+# Durante la fase de validación, solo ejecución manual.
+# Cuando se apruebe, descomentar el bloque schedule.
+on:
+  # schedule:
+  #   - cron: "0 11 * * *"  # Diario 05:00 AM hora de México (CST/UTC-6 = 11:00 UTC)
+  workflow_dispatch:
+
+env:
+  FROM_EMAIL: "Peribus Metropolitano <admin@peribusmetro.mx>"
+
+jobs:
+  sync-comercial:
+    name: Sync Comercial AdminPAQ → Supabase PROD
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Set timestamp
+        run: |
+          FECHA=$(TZ="America/Mexico_City" date +"%d/%m/%Y %H:%M:%S")
+          echo "FECHA_MX=${FECHA}" >> $GITHUB_ENV
+
+      - name: Create .env file
+        env:
+          SQL_SERVER_HOST: ${{ secrets.SQL_SERVER_HOST }}
+          SQL_SERVER_PORT: ${{ secrets.SQL_SERVER_PORT }}
+          SQL_SERVER_USER: ${{ secrets.SQL_SERVER_USER }}
+          SQL_SERVER_PASSWORD: ${{ secrets.SQL_SERVER_PASSWORD }}
+          DATABASE_POOLER_URL: ${{ secrets.DATABASE_POOLER_URL }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
+        run: |
+          cat > .env.production <<EOF
+          SQL_SERVER_HOST=${SQL_SERVER_HOST}
+          SQL_SERVER_PORT=${SQL_SERVER_PORT}
+          SQL_SERVER_USER=${SQL_SERVER_USER}
+          SQL_SERVER_PASSWORD=${SQL_SERVER_PASSWORD}
+          DATABASE_POOLER_URL=${DATABASE_POOLER_URL}
+          DATABASE_URL=${DATABASE_URL}
+          EOF
+
+      - name: "Paso 1: sync-incremental"
+        run: |
+          set -o pipefail
+          DOTENV_CONFIG_PATH=.env.production node --env-file=.env.production scripts/sync-incremental.mjs 2>&1 | tee /tmp/sync-incremental.log
+
+          SUMMARY=$(grep "^::SUMMARY_JSON::" /tmp/sync-incremental.log | tail -1 | sed 's/^::SUMMARY_JSON:://' || echo '{}')
+          echo "SYNC_INCREMENTAL_JSON<<SUMMARY_EOF" >> $GITHUB_ENV
+          echo "${SUMMARY}" >> $GITHUB_ENV
+          echo "SUMMARY_EOF" >> $GITHUB_ENV
+
+          RESUMEN=$(grep "Tiempo total" /tmp/sync-incremental.log | tail -1 || echo "Sin resumen")
+          echo "SYNC_INCREMENTAL_TIEMPO=${RESUMEN}" >> $GITHUB_ENV
+
+      - name: "Paso 2: sync-update-extra-fields"
+        run: |
+          set -o pipefail
+          DOTENV_CONFIG_PATH=.env.production node --env-file=.env.production scripts/sync-update-extra-fields.mjs 2>&1 | tee /tmp/sync-extra.log
+
+          SUMMARY=$(grep "^::SUMMARY_JSON::" /tmp/sync-extra.log | tail -1 | sed 's/^::SUMMARY_JSON:://' || echo '{}')
+          echo "SYNC_EXTRA_JSON<<SUMMARY_EOF" >> $GITHUB_ENV
+          echo "${SUMMARY}" >> $GITHUB_ENV
+          echo "SUMMARY_EOF" >> $GITHUB_ENV
+
+          ACTUALIZADOS=$(echo "${SUMMARY}" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{console.log(JSON.parse(s).updated ?? 0)}catch{console.log(0)}})" || echo "0")
+          echo "EXTRA_FIELDS_UPDATED=${ACTUALIZADOS}" >> $GITHUB_ENV
+
+      - name: "Paso 3: comercial-auto-link"
+        run: |
+          set -o pipefail
+          DOTENV_CONFIG_PATH=.env.production node --env-file=.env.production scripts/comercial-auto-link.mjs 2>&1 | tee /tmp/auto-link.log
+
+          SUMMARY=$(grep "^::SUMMARY_JSON::" /tmp/auto-link.log | tail -1 | sed 's/^::SUMMARY_JSON:://' || echo '{}')
+          echo "AUTOLINK_JSON<<SUMMARY_EOF" >> $GITHUB_ENV
+          echo "${SUMMARY}" >> $GITHUB_ENV
+          echo "SUMMARY_EOF" >> $GITHUB_ENV
+
+          DOCS_LINE=$(grep "Docs:" /tmp/auto-link.log | tail -1 || echo "Docs: N/A")
+          MOVS_LINE=$(grep "Movs:" /tmp/auto-link.log | tail -1 || echo "Movs: N/A")
+          echo "AUTOLINK_DOCS=${DOCS_LINE}" >> $GITHUB_ENV
+          echo "AUTOLINK_MOVS=${MOVS_LINE}" >> $GITHUB_ENV
+
+      - name: Clean up env file
+        if: always()
+        run: rm -f .env.production
+
+      - name: Send success email
+        if: success()
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          NOTIFY_EMAILS: ${{ secrets.BACKUP_NOTIFY_EMAILS }}
+        run: |
+          TO_JSON=$(echo "$NOTIFY_EMAILS" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | awk '{printf "\"%s\",", $0}' | sed 's/,$//')
+
+          curl -s -X POST "https://api.resend.com/emails" \
+            -H "Authorization: Bearer ${RESEND_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d @- <<EOF
+          {
+            "from": "${FROM_EMAIL}",
+            "to": [${TO_JSON}],
+            "subject": "✅ Sync Comercial PROD exitoso - ${FECHA_MX}",
+            "html": "<div style='font-family: Arial, sans-serif; max-width: 640px; margin: 0 auto;'><div style='background: #16a34a; color: white; padding: 20px; border-radius: 8px 8px 0 0;'><h2 style='margin: 0;'>✅ Sync Comercial Diario (PROD)</h2></div><div style='padding: 20px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;'><table style='width: 100%; border-collapse: collapse;'><tr><td style='padding: 8px; border-bottom: 1px solid #f3f4f6; font-weight: bold;'>Fecha</td><td style='padding: 8px; border-bottom: 1px solid #f3f4f6;'>${FECHA_MX}</td></tr><tr><td style='padding: 8px; border-bottom: 1px solid #f3f4f6; font-weight: bold;'>Paso 1 (sync-incremental)</td><td style='padding: 8px; border-bottom: 1px solid #f3f4f6;'>${SYNC_INCREMENTAL_TIEMPO:-N/A}</td></tr><tr><td style='padding: 8px; border-bottom: 1px solid #f3f4f6; font-weight: bold;'>Paso 2 (campos extra)</td><td style='padding: 8px; border-bottom: 1px solid #f3f4f6;'>${EXTRA_FIELDS_UPDATED:-N/A} actualizados</td></tr><tr><td style='padding: 8px; border-bottom: 1px solid #f3f4f6; font-weight: bold;'>Paso 3 — ${AUTOLINK_DOCS}</td><td style='padding: 8px; border-bottom: 1px solid #f3f4f6;'></td></tr><tr><td style='padding: 8px; font-weight: bold;'>Paso 3 — ${AUTOLINK_MOVS}</td><td style='padding: 8px;'></td></tr></table></div><p style='color: #6b7280; font-size: 12px; margin-top: 16px; text-align: center;'>peribus-scripts — Sync comercial automático (5:00 AM MX)</p></div>"
+          }
+          EOF
+
+      - name: Send failure email
+        if: failure()
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          NOTIFY_EMAILS: ${{ secrets.BACKUP_NOTIFY_EMAILS }}
+        run: |
+          TO_JSON=$(echo "$NOTIFY_EMAILS" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | awk '{printf "\"%s\",", $0}' | sed 's/,$//')
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          curl -s -X POST "https://api.resend.com/emails" \
+            -H "Authorization: Bearer ${RESEND_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d @- <<EOF
+          {
+            "from": "${FROM_EMAIL}",
+            "to": [${TO_JSON}],
+            "subject": "❌ ERROR Sync Comercial PROD - ${FECHA_MX}",
+            "html": "<div style='font-family: Arial, sans-serif; max-width: 640px; margin: 0 auto;'><div style='background: #dc2626; color: white; padding: 20px; border-radius: 8px 8px 0 0;'><h2 style='margin: 0;'>❌ Error en Sync Comercial (PROD)</h2></div><div style='padding: 20px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;'><p style='color: #374151;'>El sync comercial diario en <strong>PROD</strong> ha fallado.</p><table style='width: 100%; border-collapse: collapse;'><tr><td style='padding: 8px; border-bottom: 1px solid #f3f4f6; font-weight: bold;'>Fecha</td><td style='padding: 8px; border-bottom: 1px solid #f3f4f6;'>${FECHA_MX}</td></tr><tr><td style='padding: 8px; font-weight: bold;'>Ambiente</td><td style='padding: 8px;'>Production</td></tr></table><div style='margin-top: 20px; text-align: center;'><a href='${RUN_URL}' style='display: inline-block; background: #dc2626; color: white; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: bold;'>Ver logs</a></div></div></div>"
+          }
+          EOF
+
+      - name: Summary
+        if: always()
+        env:
+          SYNC_INCREMENTAL_JSON: ${{ env.SYNC_INCREMENTAL_JSON }}
+          SYNC_EXTRA_JSON: ${{ env.SYNC_EXTRA_JSON }}
+          AUTOLINK_JSON: ${{ env.AUTOLINK_JSON }}
+          FECHA_MX: ${{ env.FECHA_MX }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          if [ "$JOB_STATUS" = "success" ]; then
+            echo "### ✅ Sync Comercial PROD completado" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ❌ Sync Comercial PROD falló" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Fecha:** ${FECHA_MX}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          node <<'NODE_EOF' >> $GITHUB_STEP_SUMMARY
+          const safeParse = (raw) => { try { return JSON.parse(raw || "{}"); } catch { return {}; } };
+          const inc = safeParse(process.env.SYNC_INCREMENTAL_JSON);
+          const extra = safeParse(process.env.SYNC_EXTRA_JSON);
+          const autolink = safeParse(process.env.AUTOLINK_JSON);
+
+          const out = [];
+          out.push("#### Paso 1 — sync-incremental");
+          if (inc.tables?.length) {
+            out.push(`_Tiempo: ${inc.elapsed_seconds ?? "?"}s_`);
+            out.push("");
+            out.push("| Tabla | Faltantes | Insertados | Actualizados | Errores |");
+            out.push("|---|---:|---:|---:|---:|");
+            for (const t of inc.tables) {
+              out.push(`| ${t.name} | ${t.missing} | ${t.inserted} | ${t.updated} | ${t.errors} |`);
+            }
+            const tt = inc.totals ?? {};
+            out.push(`| **TOTAL** | **${tt.missing ?? 0}** | **${tt.inserted ?? 0}** | **${tt.updated ?? 0}** | **${tt.errors ?? 0}** |`);
+          } else {
+            out.push("_Sin datos_");
+          }
+          out.push("");
+
+          out.push("#### Paso 2 — sync-update-extra-fields");
+          if (extra.script) {
+            out.push(`_Tiempo: ${extra.elapsed_seconds ?? "?"}s_`);
+            out.push("");
+            out.push("| Candidatos | Actualizados | Errores |");
+            out.push("|---:|---:|---:|");
+            out.push(`| ${extra.candidates ?? 0} | ${extra.updated ?? 0} | ${extra.errors ?? 0} |`);
+          } else {
+            out.push("_Sin datos_");
+          }
+          out.push("");
+
+          out.push("#### Paso 3 — comercial-auto-link");
+          if (autolink.script) {
+            out.push(`_Tiempo: ${autolink.elapsed_seconds ?? "?"}s_`);
+            out.push("");
+            out.push("| Tipo | Antes | Después | Delta |");
+            out.push("|---|---:|---:|---:|");
+            const d = autolink.documents ?? {};
+            const m = autolink.movements ?? {};
+            out.push(`| Documentos | ${d.before ?? 0} | ${d.after ?? 0} | +${d.delta ?? 0} |`);
+            out.push(`| Movimientos | ${m.before ?? 0} | ${m.after ?? 0} | +${m.delta ?? 0} |`);
+          } else {
+            out.push("_Sin datos_");
+          }
+          out.push("");
+
+          console.log(out.join("\n"));
+          NODE_EOF
