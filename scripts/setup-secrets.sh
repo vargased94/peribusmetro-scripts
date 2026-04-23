@@ -56,7 +56,7 @@ set_secret() {
     echo -e "${YELLOW}[SKIP]${NC} $name — valor vacío"
     return
   fi
-  echo "$value" | gh secret set "$name" --repo "$REPO" --body -
+  gh secret set "$name" --repo "$REPO" --body "$value"
   echo -e "${GREEN}[OK]${NC}   $name"
 }
 
