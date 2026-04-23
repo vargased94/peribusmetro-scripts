@@ -1,10 +1,8 @@
 name: "Comercial Sync Daily (PROD)"
 
-# Durante la fase de validación, solo ejecución manual.
-# Cuando se apruebe, descomentar el bloque schedule.
 on:
-  # schedule:
-  #   - cron: "0 11 * * *"  # Diario 05:00 AM hora de México (CST/UTC-6 = 11:00 UTC)
+  schedule:
+    - cron: "0 11 * * *"  # Diario 05:00 AM hora de México (CST/UTC-6 = 11:00 UTC)
   workflow_dispatch:
 
 env:

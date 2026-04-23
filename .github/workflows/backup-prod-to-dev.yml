@@ -1,10 +1,8 @@
 name: "Backup PROD to DEV"
 
-# Durante la fase de validación, solo ejecución manual.
-# Cuando se apruebe, descomentar el bloque schedule.
 on:
-  # schedule:
-  #   - cron: "0 8 * * *"  # Diario 02:00 AM hora de México (CST/UTC-6 = 08:00 UTC)
+  schedule:
+    - cron: "0 8 * * *"  # Diario 02:00 AM hora de México (CST/UTC-6 = 08:00 UTC)
   workflow_dispatch:
     inputs:
       skip_restore:
