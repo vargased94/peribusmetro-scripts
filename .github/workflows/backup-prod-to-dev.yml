@@ -1,4 +1,4 @@
-name: "Backup PROD → DEV"
+name: "Backup PROD to DEV"
 
 # Durante la fase de validación, solo ejecución manual.
 # Cuando se apruebe, descomentar el bloque schedule.
@@ -23,7 +23,7 @@ env:
 
 jobs:
   backup-and-restore:
-    name: Backup PROD → Restore DEV
+    name: Backup PROD to Restore DEV
     runs-on: ubuntu-latest
     timeout-minutes: 120
 

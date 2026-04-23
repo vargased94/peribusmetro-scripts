@@ -12,7 +12,7 @@ env:
 
 jobs:
   sync-comercial:
-    name: Sync Comercial AdminPAQ → Supabase PROD
+    name: Sync Comercial AdminPAQ to Supabase PROD
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
