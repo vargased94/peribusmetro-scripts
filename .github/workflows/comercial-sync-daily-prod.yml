@@ -43,14 +43,14 @@ jobs:
           DATABASE_POOLER_URL: ${{ secrets.DATABASE_POOLER_URL }}
           DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
         run: |
-          cat > .env.production <<EOF
-          SQL_SERVER_HOST=${SQL_SERVER_HOST}
-          SQL_SERVER_PORT=${SQL_SERVER_PORT}
-          SQL_SERVER_USER=${SQL_SERVER_USER}
-          SQL_SERVER_PASSWORD=${SQL_SERVER_PASSWORD}
-          DATABASE_POOLER_URL=${DATABASE_POOLER_URL}
-          DATABASE_URL=${DATABASE_URL}
-          EOF
+          {
+            echo "SQL_SERVER_HOST=${SQL_SERVER_HOST}"
+            echo "SQL_SERVER_PORT=${SQL_SERVER_PORT}"
+            echo "SQL_SERVER_USER=${SQL_SERVER_USER}"
+            echo "SQL_SERVER_PASSWORD=${SQL_SERVER_PASSWORD}"
+            echo "DATABASE_POOLER_URL=${DATABASE_POOLER_URL}"
+            echo "DATABASE_URL=${DATABASE_URL}"
+          } > .env.production
 
       - name: "Paso 1: sync-incremental"
         run: |
