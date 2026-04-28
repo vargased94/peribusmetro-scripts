@@ -218,11 +218,31 @@ async function fetchMonitoring(fechaInicial, fechaFinal) {
 // MAPEO API → DB
 // ----------------------------------------------------------------------------
 
+/**
+ * Normaliza la hora del API Tothem a formato HH:MM (5 chars).
+ * El API devuelve "HH:MM" directamente, pero por robustez aceptamos también
+ * formato compacto "HHmmss" / "HHmm" / "Hmmss" por si cambia.
+ */
+function normalizeHour(raw) {
+  if (raw == null) return null;
+  const s = String(raw).trim();
+
+  // Caso normal: ya viene "HH:MM" o "HH:MM:SS"
+  if (/^\d{2}:\d{2}(:\d{2})?$/.test(s)) {
+    return s.slice(0, 5);
+  }
+
+  // Caso legacy: solo dígitos (HHmmss / HHmm / Hmmss)
+  if (/^\d+$/.test(s)) {
+    const padded = s.padStart(6, "0");
+    return `${padded.slice(0, 2)}:${padded.slice(2, 4)}`;
+  }
+
+  return null;
+}
+
 function mapReading(row) {
-  const horaRaw = String(row?.hora ?? "").padStart(6, "0");
-  const hh = horaRaw.slice(0, 2);
-  const mm = horaRaw.slice(2, 4);
-  const hour = `${hh}:${mm}`;
+  const hour = normalizeHour(row?.hora);
 
   return {
     date: row?.fecha ?? null,
@@ -246,6 +266,7 @@ function isValidReading(r) {
   return (
     r.date &&
     r.hour &&
+    /^\d{2}:\d{2}$/.test(r.hour) && // formato estricto HH:MM
     Number.isFinite(r.tank_number) &&
     r.tank_number > 0
   );
