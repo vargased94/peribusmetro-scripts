@@ -16,8 +16,11 @@ Todos los secrets se configuran en: **Settings → Secrets and variables → Act
 | `SQL_SERVER_PORT` | Puerto de SQL Server (normalmente 1433) | `comercial-sync-*.yml` |
 | `SQL_SERVER_USER` | Usuario de SQL Server | `comercial-sync-*.yml` |
 | `SQL_SERVER_PASSWORD` | Password de SQL Server | `comercial-sync-*.yml` |
+| `TOTHEM_HOST` | URL base del API Tothem (con `/api`) | `sync-tank-monitoring-*.yml` |
+| `TOTHEM_API_USUARIO` | Usuario para login en Tothem | `sync-tank-monitoring-*.yml` |
+| `TOTHEM_API_KEY` | API key de Tothem | `sync-tank-monitoring-*.yml` |
 
-**Total: 10 secrets.**
+**Total: 13 secrets.**
 
 ## Cómo obtener cada valor
 
@@ -28,6 +31,7 @@ Todos los valores ya existen en el repo `peribus-incidents-admin` (`Settings →
    - **Postgres URLs**: Supabase → Project → Settings → Database → Connection string.
    - **SQL Server**: desde el archivo `.env.production` local del proyecto `peribus-incidents-admin`.
    - **Resend**: Resend dashboard → API Keys.
+   - **Tothem**: desde el archivo `.env.production` local del proyecto `peribus-incidents-admin` (`TOTHEM_HOST`, `TOTHEM_API_USUARIO`, `TOTHEM_API_KEY`).
 
 ## Ejemplo con `gh CLI`
 

@@ -7,7 +7,7 @@ npm install
 cp .env.example .env.development    # y .env.production
 ```
 
-Ambos archivos deben contener `DATABASE_URL`, `DATABASE_POOLER_URL` y las 4 variables `SQL_SERVER_*`.
+Ambos archivos deben contener `DATABASE_URL`, `DATABASE_POOLER_URL`, las 4 variables `SQL_SERVER_*` y las 3 variables `TOTHEM_*` (para `sync-tank-monitoring`).
 
 ---
 
@@ -66,7 +66,31 @@ npm run autolink:dev
 
 ---
 
-### 4. `backup-prod-to-dev.sh`
+### 4. `sync-tank-monitoring.mjs`
+
+**Qué hace.** Trae lecturas del API Tothem (sitio 130 — monitoreo) y las inserta en `diesel_tank_monitoring`. Alimenta la gráfica "Nivel del Tanque" del reporte `/dashboard/reports/diesel-inventory`.
+
+**Comando.**
+```bash
+# Día anterior (default)
+npm run sync:tanks:dev
+
+# Backfill por rango (paginado día a día)
+DOTENV_CONFIG_PATH=.env.development node --env-file=.env.development \
+  scripts/sync-tank-monitoring.mjs --from 2026-02-27 --to 2026-04-27
+```
+
+**Duración típica.** 2-5 segundos por día.
+
+**Idempotente.** `INSERT ... ON CONFLICT (date, hour, tank_number) DO NOTHING`.
+
+**Notas.**
+- Detalle completo en `docs/TANK-MONITORING.md`.
+- En PROD corre automático todos los días a las 5:00 AM México.
+
+---
+
+### 5. `backup-prod-to-dev.sh`
 
 **Qué hace.** `pg_dump` de PROD y `pg_restore` en DEV. Excluye datos históricos de `income_transactions` (se filtran por `transaction_date >= $INCOME_TRANSACTIONS_MIN_DATE`, por defecto `2026-01-01`).
 
@@ -96,6 +120,13 @@ INCOME_TRANSACTIONS_MIN_DATE=2025-06-01 ./scripts/backup-prod-to-dev.sh
 gh workflow run backup-prod-to-dev.yml --repo vargased94/peribusmetro-scripts
 gh workflow run comercial-sync-daily-dev.yml --repo vargased94/peribusmetro-scripts
 gh workflow run comercial-sync-daily-prod.yml --repo vargased94/peribusmetro-scripts
+gh workflow run sync-tank-monitoring-dev.yml --repo vargased94/peribusmetro-scripts
+gh workflow run sync-tank-monitoring-prod.yml --repo vargased94/peribusmetro-scripts
+
+# Con inputs de backfill:
+gh workflow run sync-tank-monitoring-prod.yml \
+  --repo vargased94/peribusmetro-scripts \
+  -f from=2026-02-27 -f to=2026-04-27
 ```
 
 ### Ver logs
@@ -118,3 +149,5 @@ gh run view <RUN_ID> --log-failed --repo vargased94/peribusmetro-scripts  # solo
 | `relation "comercial_adm_movements" does not exist` | La base apuntada en `DATABASE_POOLER_URL` no tiene las tablas. Verificas estás apuntando a la DB correcta. |
 | `duplicate key value violates unique constraint` en auto-link | No debería pasar (usa `ON CONFLICT DO NOTHING`). Si pasa, el schema de `comercial_*_links` cambió. |
 | Sync muy lento | Lotes de 500 es el default. Si tarda >5min, revisar red con SQL Server. |
+| `Login Tothem fallo (401)` | `TOTHEM_API_USUARIO` / `TOTHEM_API_KEY` mal configurados en secrets. |
+| Gráfica "Nivel del Tanque" sigue vacía después del sync | Validar con `SELECT MAX(date) FROM diesel_tank_monitoring` que el job esté llenando filas. Ver `docs/TANK-MONITORING.md`. |

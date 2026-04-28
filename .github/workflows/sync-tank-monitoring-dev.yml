@@ -1,0 +1,116 @@
+name: "Sync Tank Monitoring (DEV)"
+
+# Apunta a Supabase DEV. Solo se ejecuta manualmente para validar
+# el script antes de tocar PROD.
+
+on:
+  workflow_dispatch:
+    inputs:
+      from:
+        description: "Fecha inicio (YYYY-MM-DD). Vacío = día anterior."
+        required: false
+        default: ""
+      to:
+        description: "Fecha fin (YYYY-MM-DD). Vacío = igual a 'from' o día anterior."
+        required: false
+        default: ""
+
+env:
+  FROM_EMAIL: "Peribus Metropolitano <admin@peribusmetro.mx>"
+
+jobs:
+  sync-tanks:
+    name: Sync Tank Monitoring to Supabase DEV
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Set timestamp
+        run: |
+          FECHA=$(TZ="America/Mexico_City" date +"%d/%m/%Y %H:%M:%S")
+          echo "FECHA_MX=${FECHA}" >> $GITHUB_ENV
+
+      - name: Create .env file
+        env:
+          DATABASE_POOLER_URL: ${{ secrets.DATABASE_POOLER_URL_DEV }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL_DEV }}
+          TOTHEM_HOST: ${{ secrets.TOTHEM_HOST }}
+          TOTHEM_API_USUARIO: ${{ secrets.TOTHEM_API_USUARIO }}
+          TOTHEM_API_KEY: ${{ secrets.TOTHEM_API_KEY }}
+        run: |
+          {
+            echo "DATABASE_POOLER_URL=${DATABASE_POOLER_URL}"
+            echo "DATABASE_URL=${DATABASE_URL}"
+            echo "TOTHEM_HOST=${TOTHEM_HOST}"
+            echo "TOTHEM_API_USUARIO=${TOTHEM_API_USUARIO}"
+            echo "TOTHEM_API_KEY=${TOTHEM_API_KEY}"
+          } > .env.development
+
+      - name: "Run sync-tank-monitoring"
+        env:
+          INPUT_FROM: ${{ inputs.from }}
+          INPUT_TO: ${{ inputs.to }}
+        run: |
+          set -o pipefail
+          ARGS=""
+          if [ -n "$INPUT_FROM" ]; then ARGS="$ARGS --from $INPUT_FROM"; fi
+          if [ -n "$INPUT_TO" ]; then ARGS="$ARGS --to $INPUT_TO"; fi
+
+          DOTENV_CONFIG_PATH=.env.development node --env-file=.env.development scripts/sync-tank-monitoring.mjs $ARGS 2>&1 | tee /tmp/sync-tanks.log
+
+          SUMMARY=$(grep "^::SUMMARY_JSON::" /tmp/sync-tanks.log | tail -1 | sed 's/^::SUMMARY_JSON:://' || echo '{}')
+          echo "SYNC_TANKS_JSON<<SUMMARY_EOF" >> $GITHUB_ENV
+          echo "${SUMMARY}" >> $GITHUB_ENV
+          echo "SUMMARY_EOF" >> $GITHUB_ENV
+
+      - name: Clean up env file
+        if: always()
+        run: rm -f .env.development
+
+      - name: Summary
+        if: always()
+        env:
+          SYNC_TANKS_JSON: ${{ env.SYNC_TANKS_JSON }}
+          FECHA_MX: ${{ env.FECHA_MX }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          if [ "$JOB_STATUS" = "success" ]; then
+            echo "### ✅ Sync Tank Monitoring DEV completado" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ❌ Sync Tank Monitoring DEV falló" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Fecha:** ${FECHA_MX}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          node <<'NODE_EOF' >> $GITHUB_STEP_SUMMARY
+          const safeParse = (raw) => { try { return JSON.parse(raw || "{}"); } catch { return {}; } };
+          const r = safeParse(process.env.SYNC_TANKS_JSON);
+
+          const out = [];
+          out.push("#### Resumen");
+          if (r.script) {
+            out.push(`_Tiempo: ${r.elapsed_seconds ?? "?"}s_`);
+            out.push("");
+            out.push("| Rango | Días | Lecturas API | Insertadas | Duplicadas | Errores |");
+            out.push("|---|---:|---:|---:|---:|---:|");
+            out.push(`| ${r.from ?? "-"} → ${r.to ?? "-"} | ${r.days ?? 0} | ${r.fetched ?? 0} | ${r.inserted ?? 0} | ${r.skipped ?? 0} | ${r.errors ?? 0} |`);
+          } else {
+            out.push("_Sin datos_");
+          }
+          out.push("");
+
+          console.log(out.join("\n"));
+          NODE_EOF
