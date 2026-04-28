@@ -4,16 +4,20 @@
 // Sincroniza lecturas del API Tothem (sitio 130 - monitoreo) hacia la tabla
 // `diesel_tank_monitoring` en Supabase.
 //
-// Uso:
-//   # Día anterior (default), zona horaria America/Mexico_City
-//   node --env-file=.env.production scripts/sync-tank-monitoring.mjs
+// Modo automático (default):
+//   Lee MAX(date) en diesel_tank_monitoring y procesa desde
+//   ultima_fecha + 1 hasta AYER (zona America/Mexico_City).
+//   Si la tabla está vacía, hace fallback a "ayer" y deja warning para que
+//   el operador dispare el backfill grande manualmente.
 //
-//   # Backfill por rango (paginado día a día)
-//   node --env-file=.env.production scripts/sync-tank-monitoring.mjs \
-//        --from 2026-02-27 --to 2026-04-27
+// Modo manual:
+//   --from YYYY-MM-DD --to YYYY-MM-DD para cubrir un rango específico.
 //
-// Idempotente:
-//   INSERT ... ON CONFLICT (date, hour, tank_number) DO NOTHING
+// Eficiencia:
+//   - Concurrencia limitada (CONCURRENCY = 3 fetches simultáneos al API).
+//   - Reintentos con backoff exponencial en errores 5xx / red.
+//   - Un solo INSERT por día (chunks de 500 filas máximo).
+//   - Idempotente: ON CONFLICT (date, hour, tank_number) DO NOTHING.
 // =============================================================================
 
 import postgres from "postgres";
@@ -30,6 +34,17 @@ const TOTHEM_HOST = TOTHEM_HOST_RAW.replace(/\/$/, "");
 const TOTHEM_USER = process.env.TOTHEM_API_USUARIO || process.env.TOTHEM_USER || "";
 const TOTHEM_KEY = process.env.TOTHEM_API_KEY || process.env.TOTHEM_KEY || "";
 const SITIO = process.env.TOTHEM_SITIO || "130";
+
+// Concurrencia: máximo de fetches al API en paralelo. 3 es conservador y
+// evita saturar Tothem cuando hay backfills grandes.
+const CONCURRENCY = Number(process.env.SYNC_TANKS_CONCURRENCY || 3);
+
+// Reintentos para errores transitorios del API
+const MAX_RETRIES = 3;
+const RETRY_BASE_MS = 1000; // 1s, 2s, 4s
+
+// Tamaño máximo de filas por INSERT (chunk del pooler)
+const INSERT_CHUNK = 500;
 
 if (!TOTHEM_HOST || !TOTHEM_USER || !TOTHEM_KEY) {
   console.error(
@@ -76,35 +91,66 @@ function addDays(dateStr, n) {
   return d.toISOString().slice(0, 10);
 }
 
+/** Genera array de YYYY-MM-DD entre from y to inclusive. */
+function dateRange(from, to) {
+  const out = [];
+  let cursor = from;
+  while (cursor <= to) {
+    out.push(cursor);
+    cursor = addDays(cursor, 1);
+  }
+  return out;
+}
+
 function logInfo(msg) {
   console.log(`[sync-tank-monitoring] ${msg}`);
 }
 
+function logWarn(msg) {
+  console.log(`[sync-tank-monitoring] ⚠️  ${msg}`);
+}
+
 function logError(msg) {
-  console.error(`[sync-tank-monitoring] ${msg}`);
+  console.error(`[sync-tank-monitoring] ❌ ${msg}`);
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 // ----------------------------------------------------------------------------
-// CLIENTE TOTHEM
+// CLIENTE TOTHEM (con login compartido y reintento en 401)
 // ----------------------------------------------------------------------------
 
 let _accessToken = null;
+let _loginPromise = null;
 
 async function loginTothem() {
-  const url = `${TOTHEM_HOST}/login`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ usuario: TOTHEM_USER, api_key: TOTHEM_KEY }),
-  });
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`Login Tothem fallo (${res.status}): ${txt.slice(0, 200)}`);
+  // Si ya hay un login en curso, esperarlo en vez de duplicar la petición.
+  if (_loginPromise) return _loginPromise;
+
+  _loginPromise = (async () => {
+    const url = `${TOTHEM_HOST}/login`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ usuario: TOTHEM_USER, api_key: TOTHEM_KEY }),
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new Error(`Login Tothem fallo (${res.status}): ${txt.slice(0, 200)}`);
+    }
+    const data = await res.json();
+    if (!data?.access_token) throw new Error("Login Tothem no devolvió access_token");
+    _accessToken = data.access_token;
+    return _accessToken;
+  })();
+
+  try {
+    return await _loginPromise;
+  } finally {
+    _loginPromise = null;
   }
-  const data = await res.json();
-  if (!data?.access_token) throw new Error("Login Tothem no devolvió access_token");
-  _accessToken = data.access_token;
-  return _accessToken;
 }
 
 async function fetchMonitoring(fechaInicial, fechaFinal) {
@@ -115,43 +161,63 @@ async function fetchMonitoring(fechaInicial, fechaFinal) {
   url.searchParams.append("fecha_final", fechaFinal);
   url.searchParams.append("orden", "1");
 
-  const res = await fetch(url.toString(), {
-    headers: { Authorization: `Bearer ${_accessToken}` },
-  });
+  let lastError = null;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const res = await fetch(url.toString(), {
+        headers: { Authorization: `Bearer ${_accessToken}` },
+      });
 
-  // Si el token expiró, reintentar una vez con login fresco
-  if (res.status === 401) {
-    await loginTothem();
-    const retry = await fetch(url.toString(), {
-      headers: { Authorization: `Bearer ${_accessToken}` },
-    });
-    if (!retry.ok) {
-      const txt = await retry.text().catch(() => "");
-      throw new Error(`Monitoreo fallo (${retry.status}): ${txt.slice(0, 200)}`);
+      // Token expirado: refrescar y reintentar este mismo intento sin contar
+      if (res.status === 401) {
+        _accessToken = null;
+        await loginTothem();
+        continue;
+      }
+
+      // 429/5xx: error transitorio → backoff
+      if (res.status === 429 || (res.status >= 500 && res.status < 600)) {
+        const txt = await res.text().catch(() => "");
+        lastError = new Error(`HTTP ${res.status}: ${txt.slice(0, 200)}`);
+        if (attempt < MAX_RETRIES) {
+          const delay = RETRY_BASE_MS * Math.pow(2, attempt);
+          await sleep(delay);
+          continue;
+        }
+        throw lastError;
+      }
+
+      if (!res.ok) {
+        const txt = await res.text().catch(() => "");
+        throw new Error(`Monitoreo fallo (${res.status}): ${txt.slice(0, 200)}`);
+      }
+
+      const json = await res.json();
+      return Array.isArray(json?.data) ? json.data : [];
+    } catch (err) {
+      // Error de red: reintentar con backoff
+      lastError = err;
+      const isNetworkError =
+        err?.cause?.code === "ECONNRESET" ||
+        err?.cause?.code === "ETIMEDOUT" ||
+        err?.cause?.code === "UND_ERR_SOCKET" ||
+        /fetch failed/i.test(err?.message || "");
+      if (isNetworkError && attempt < MAX_RETRIES) {
+        const delay = RETRY_BASE_MS * Math.pow(2, attempt);
+        await sleep(delay);
+        continue;
+      }
+      throw err;
     }
-    const json = await retry.json();
-    return Array.isArray(json?.data) ? json.data : [];
   }
 
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`Monitoreo fallo (${res.status}): ${txt.slice(0, 200)}`);
-  }
-
-  const json = await res.json();
-  return Array.isArray(json?.data) ? json.data : [];
+  throw lastError ?? new Error("fetchMonitoring agotó reintentos");
 }
 
 // ----------------------------------------------------------------------------
 // MAPEO API → DB
 // ----------------------------------------------------------------------------
 
-/**
- * El API devuelve `fecha` como YYYY-MM-DD y `hora` como HHmmss (string).
- * En BD el unique index es (date, hour, tank_number) y `hour` es VARCHAR(5).
- * Convertimos hora a HH:MM (truncando segundos) para coincidir con la convención
- * de la tabla (la tabla tiene `length: 5`).
- */
 function mapReading(row) {
   const horaRaw = String(row?.hora ?? "").padStart(6, "0");
   const hh = horaRaw.slice(0, 2);
@@ -195,27 +261,15 @@ async function processDay(dateStr) {
 
   const apiRows = await fetchMonitoring(fechaInicial, fechaFinal);
   const mapped = apiRows.map(mapReading).filter(isValidReading);
-
-  if (mapped.length === 0) {
-    return { date: dateStr, fetched: apiRows.length, inserted: 0, skipped: 0 };
-  }
-
-  // Filtrar solo lecturas que caigan EXACTAMENTE en el día solicitado
-  // (el API a veces trae lecturas adyacentes por la forma en que filtra).
   const onlyForDay = mapped.filter((r) => r.date === dateStr);
 
-  // Antes/después: calcular cuántas filas existen para ese día
-  const before = await sql`
-    SELECT COUNT(*)::int AS c
-    FROM diesel_tank_monitoring
-    WHERE date = ${dateStr}
-  `;
+  if (onlyForDay.length === 0) {
+    return { date: dateStr, fetched: apiRows.length, valid: 0, inserted: 0, skipped: 0 };
+  }
 
-  // Insertar en chunks para no exceder límites del pooler
-  const CHUNK = 500;
   let inserted = 0;
-  for (let i = 0; i < onlyForDay.length; i += CHUNK) {
-    const chunk = onlyForDay.slice(i, i + CHUNK);
+  for (let i = 0; i < onlyForDay.length; i += INSERT_CHUNK) {
+    const chunk = onlyForDay.slice(i, i + INSERT_CHUNK);
     const result = await sql`
       INSERT INTO diesel_tank_monitoring ${sql(
         chunk,
@@ -234,15 +288,71 @@ async function processDay(dateStr) {
     inserted += result.count ?? 0;
   }
 
-  const skipped = onlyForDay.length - inserted;
-
   return {
     date: dateStr,
     fetched: apiRows.length,
     valid: onlyForDay.length,
     inserted,
-    skipped,
-    rows_before: before[0]?.c ?? 0,
+    skipped: onlyForDay.length - inserted,
+  };
+}
+
+// ----------------------------------------------------------------------------
+// EJECUTOR CON CONCURRENCIA LIMITADA
+// ----------------------------------------------------------------------------
+
+async function runWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const inFlight = [];
+
+  async function next() {
+    while (cursor < items.length) {
+      const idx = cursor++;
+      try {
+        results[idx] = await worker(items[idx], idx);
+      } catch (err) {
+        results[idx] = { error: err?.message || String(err), item: items[idx] };
+      }
+    }
+  }
+
+  for (let i = 0; i < Math.min(limit, items.length); i++) {
+    inFlight.push(next());
+  }
+  await Promise.all(inFlight);
+  return results;
+}
+
+// ----------------------------------------------------------------------------
+// CÁLCULO DE RANGO AUTOMÁTICO
+// ----------------------------------------------------------------------------
+
+async function computeAutoRange() {
+  const rows = await sql`
+    SELECT MAX(date)::text AS last_date
+    FROM diesel_tank_monitoring
+    WHERE active = 1
+  `;
+  const lastDate = rows[0]?.last_date ?? null;
+  const yesterday = addDays(todayInMx(), -1);
+
+  if (!lastDate) {
+    return {
+      from: yesterday,
+      to: yesterday,
+      lastDate: null,
+      empty: true,
+    };
+  }
+
+  const from = addDays(lastDate, 1);
+  return {
+    from,
+    to: yesterday,
+    lastDate,
+    empty: false,
+    upToDate: from > yesterday,
   };
 }
 
@@ -253,82 +363,143 @@ async function processDay(dateStr) {
 async function main() {
   const t0 = Date.now();
 
-  // Determinar rango
   const cliFrom = getArg("from");
   const cliTo = getArg("to");
 
   let fromDate;
   let toDate;
+  let mode;
+  let warnings = [];
 
-  if (cliFrom && cliTo) {
-    fromDate = cliFrom;
-    toDate = cliTo;
-  } else if (cliFrom && !cliTo) {
-    fromDate = cliFrom;
-    toDate = cliFrom;
+  if (cliFrom || cliTo) {
+    // Modo manual
+    fromDate = cliFrom || cliTo;
+    toDate = cliTo || cliFrom;
+    mode = "manual";
+    if (fromDate > toDate) {
+      logError(`Rango invalido: from=${fromDate} > to=${toDate}`);
+      await sql.end();
+      process.exit(1);
+    }
+    logInfo(`Modo manual — rango ${fromDate} → ${toDate}`);
   } else {
-    // Default: día anterior en zona MX
-    const yesterday = addDays(todayInMx(), -1);
-    fromDate = yesterday;
-    toDate = yesterday;
+    // Modo auto
+    mode = "auto";
+    const auto = await computeAutoRange();
+    if (auto.empty) {
+      const yesterday = addDays(todayInMx(), -1);
+      fromDate = yesterday;
+      toDate = yesterday;
+      const warn =
+        `La tabla diesel_tank_monitoring está vacía. ` +
+        `Procesando solo ${yesterday}. Para backfill histórico corre manual con --from/--to.`;
+      logWarn(warn);
+      warnings.push(warn);
+    } else if (auto.upToDate) {
+      logInfo(
+        `Última sincronización: ${auto.lastDate}. Sin días pendientes (hasta ayer ${auto.to}).`
+      );
+      const summary = {
+        script: "sync-tank-monitoring",
+        mode,
+        last_synced_date: auto.lastDate,
+        from: null,
+        to: null,
+        days: 0,
+        fetched: 0,
+        valid: 0,
+        inserted: 0,
+        skipped: 0,
+        errors: 0,
+        warnings,
+        elapsed_seconds: Math.round((Date.now() - t0) / 1000),
+      };
+      console.log(`::SUMMARY_JSON::${JSON.stringify(summary)}`);
+      logInfo("Nada que sincronizar.");
+      await sql.end();
+      return;
+    } else {
+      fromDate = auto.from;
+      toDate = auto.to;
+      logInfo(
+        `Modo auto — última sincronización: ${auto.lastDate}. Procesando ${fromDate} → ${toDate}`
+      );
+    }
   }
 
-  if (fromDate > toDate) {
-    logError(`Rango invalido: from=${fromDate} > to=${toDate}`);
-    await sql.end();
-    process.exit(1);
+  const days = dateRange(fromDate, toDate);
+  logInfo(
+    `Tothem: ${TOTHEM_HOST}  sitio=${SITIO}  días=${days.length}  concurrencia=${CONCURRENCY}`
+  );
+
+  if (days.length > 7) {
+    const warn = `Procesando ${days.length} días en una sola corrida (>7). Si el API rate-limita, partir en bloques manuales.`;
+    logWarn(warn);
+    warnings.push(warn);
   }
 
-  logInfo(`Iniciando sync — rango ${fromDate} → ${toDate} (zona MX)`);
-  logInfo(`Tothem: ${TOTHEM_HOST}  sitio=${SITIO}`);
+  // Asegurar login antes del fan-out (evita N logins simultáneos)
+  await loginTothem();
 
-  const results = [];
+  const results = await runWithConcurrency(days, CONCURRENCY, async (day) => {
+    try {
+      const r = await processDay(day);
+      logInfo(
+        `  ${r.date}  fetched=${r.fetched}  valid=${r.valid}  inserted=${r.inserted}  skipped=${r.skipped}`
+      );
+      return r;
+    } catch (err) {
+      const msg = err?.message || String(err);
+      logError(`  ${day}  ERROR: ${msg}`);
+      return { date: day, error: msg };
+    }
+  });
+
+  // Ordenar por fecha (la concurrencia los puede regresar fuera de orden)
+  results.sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+
   let totalFetched = 0;
   let totalValid = 0;
   let totalInserted = 0;
   let totalSkipped = 0;
+  let errorCount = 0;
   let firstError = null;
 
-  let cursor = fromDate;
-  while (cursor <= toDate) {
-    try {
-      const r = await processDay(cursor);
-      results.push(r);
-      totalFetched += r.fetched ?? 0;
-      totalValid += r.valid ?? 0;
-      totalInserted += r.inserted ?? 0;
-      totalSkipped += r.skipped ?? 0;
-      logInfo(
-        `  ${r.date}  fetched=${r.fetched}  valid=${r.valid ?? 0}  inserted=${r.inserted}  skipped=${r.skipped}`
-      );
-    } catch (err) {
-      const msg = err?.message || String(err);
-      logError(`  ${cursor}  ERROR: ${msg}`);
-      results.push({ date: cursor, error: msg });
-      if (!firstError) firstError = msg;
+  for (const r of results) {
+    if (r.error) {
+      errorCount++;
+      if (!firstError) firstError = r.error;
+      continue;
     }
-    cursor = addDays(cursor, 1);
+    totalFetched += r.fetched ?? 0;
+    totalValid += r.valid ?? 0;
+    totalInserted += r.inserted ?? 0;
+    totalSkipped += r.skipped ?? 0;
   }
 
   const elapsedSeconds = Math.round((Date.now() - t0) / 1000);
 
-  // Resumen JSON para consumo del workflow
   const summary = {
     script: "sync-tank-monitoring",
+    mode,
+    last_synced_date: mode === "auto" ? (await sql`
+      SELECT MAX(date)::text AS d FROM diesel_tank_monitoring WHERE active = 1
+    `)[0]?.d ?? null : null,
     from: fromDate,
     to: toDate,
-    days: results.length,
+    days: days.length,
     fetched: totalFetched,
     valid: totalValid,
     inserted: totalInserted,
     skipped: totalSkipped,
-    errors: results.filter((r) => r.error).length,
+    errors: errorCount,
+    warnings,
     elapsed_seconds: elapsedSeconds,
   };
 
   console.log(`::SUMMARY_JSON::${JSON.stringify(summary)}`);
   logInfo(
-    `Tiempo total: ${elapsedSeconds}s — días=${summary.days} fetched=${totalFetched} inserted=${totalInserted} skipped=${totalSkipped} errors=${summary.errors}`
+    `Tiempo total: ${elapsedSeconds}s — días=${summary.days} fetched=${totalFetched} inserted=${totalInserted} skipped=${totalSkipped} errors=${errorCount}`
   );
 
   await sql.end();

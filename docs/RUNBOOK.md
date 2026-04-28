@@ -120,11 +120,15 @@ INCOME_TRANSACTIONS_MIN_DATE=2025-06-01 ./scripts/backup-prod-to-dev.sh
 gh workflow run backup-prod-to-dev.yml --repo vargased94/peribusmetro-scripts
 gh workflow run comercial-sync-daily-dev.yml --repo vargased94/peribusmetro-scripts
 gh workflow run comercial-sync-daily-prod.yml --repo vargased94/peribusmetro-scripts
-gh workflow run sync-tank-monitoring-dev.yml --repo vargased94/peribusmetro-scripts
-gh workflow run sync-tank-monitoring-prod.yml --repo vargased94/peribusmetro-scripts
+gh workflow run sync-tank-monitoring-dev.yml  --repo vargased94/peribusmetro-scripts  # modo auto DEV
+gh workflow run sync-tank-monitoring-prod.yml --repo vargased94/peribusmetro-scripts  # modo auto PROD
 
-# Con inputs de backfill:
-gh workflow run sync-tank-monitoring-prod.yml \
+# Backfill (rango específico):
+gh workflow run sync-tank-monitoring-backfill-prod.yml \
+  --repo vargased94/peribusmetro-scripts \
+  -f from=2026-02-27 -f to=2026-04-27
+
+gh workflow run sync-tank-monitoring-backfill-dev.yml \
   --repo vargased94/peribusmetro-scripts \
   -f from=2026-02-27 -f to=2026-04-27
 ```

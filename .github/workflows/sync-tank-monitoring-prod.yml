@@ -10,15 +10,6 @@ on:
   schedule:
     - cron: "0 11 * * *"
   workflow_dispatch:
-    inputs:
-      from:
-        description: "Fecha inicio (YYYY-MM-DD). Vacío = día anterior."
-        required: false
-        default: ""
-      to:
-        description: "Fecha fin (YYYY-MM-DD). Vacío = igual a 'from' o día anterior."
-        required: false
-        default: ""
 
 env:
   FROM_EMAIL: "Peribus Metropolitano <admin@peribusmetro.mx>"
@@ -63,17 +54,10 @@ jobs:
             echo "TOTHEM_API_KEY=${TOTHEM_API_KEY}"
           } > .env.production
 
-      - name: "Run sync-tank-monitoring"
-        env:
-          INPUT_FROM: ${{ inputs.from }}
-          INPUT_TO: ${{ inputs.to }}
+      - name: "Run sync-tank-monitoring (modo auto)"
         run: |
           set -o pipefail
-          ARGS=""
-          if [ -n "$INPUT_FROM" ]; then ARGS="$ARGS --from $INPUT_FROM"; fi
-          if [ -n "$INPUT_TO" ]; then ARGS="$ARGS --to $INPUT_TO"; fi
-
-          DOTENV_CONFIG_PATH=.env.production node --env-file=.env.production scripts/sync-tank-monitoring.mjs $ARGS 2>&1 | tee /tmp/sync-tanks.log
+          DOTENV_CONFIG_PATH=.env.production node --env-file=.env.production scripts/sync-tank-monitoring.mjs 2>&1 | tee /tmp/sync-tanks.log
 
           SUMMARY=$(grep "^::SUMMARY_JSON::" /tmp/sync-tanks.log | tail -1 | sed 's/^::SUMMARY_JSON:://' || echo '{}')
           echo "SYNC_TANKS_JSON<<SUMMARY_EOF" >> $GITHUB_ENV
