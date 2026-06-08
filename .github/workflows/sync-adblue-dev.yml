@@ -1,0 +1,121 @@
+name: "Sync AdBlue (DEV)"
+
+# Sincroniza las cargas de AdBlue/Urea desde la API Piusi B.Smart hacia la tabla
+# `supramax_diesel_charges` (provider = 'BSMART') en Supabase DEV.
+#
+# Apunta a Supabase DEV. Solo se ejecuta manualmente para validar el script
+# antes de tocar PROD. Acepta inputs from/to opcionales para backfill.
+
+on:
+  workflow_dispatch:
+    inputs:
+      from:
+        description: "Fecha inicial YYYY-MM-DD (opcional, backfill)"
+        required: false
+      to:
+        description: "Fecha final YYYY-MM-DD (opcional, backfill)"
+        required: false
+
+env:
+  FROM_EMAIL: "Peribus Metropolitano <admin@peribusmetro.mx>"
+
+jobs:
+  sync-adblue:
+    name: Sync AdBlue to Supabase DEV
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Set timestamp
+        run: |
+          FECHA=$(TZ="America/Mexico_City" date +"%d/%m/%Y %H:%M:%S")
+          echo "FECHA_MX=${FECHA}" >> $GITHUB_ENV
+
+      - name: Create .env file
+        env:
+          DATABASE_POOLER_URL: ${{ secrets.DATABASE_POOLER_URL_DEV }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL_DEV }}
+          BSMART_HOST: ${{ secrets.BSMART_HOST }}
+          BSMART_CLIENT_ID: ${{ secrets.BSMART_CLIENT_ID }}
+          BSMART_CLIENT_SECRET: ${{ secrets.BSMART_CLIENT_SECRET }}
+        run: |
+          {
+            echo "DATABASE_POOLER_URL=${DATABASE_POOLER_URL}"
+            echo "DATABASE_URL=${DATABASE_URL}"
+            echo "BSMART_HOST=${BSMART_HOST}"
+            echo "BSMART_CLIENT_ID=${BSMART_CLIENT_ID}"
+            echo "BSMART_CLIENT_SECRET=${BSMART_CLIENT_SECRET}"
+          } > .env.development
+
+      - name: "Run sync-adblue"
+        env:
+          INPUT_FROM: ${{ github.event.inputs.from }}
+          INPUT_TO: ${{ github.event.inputs.to }}
+        run: |
+          set -o pipefail
+          ARGS=""
+          if [ -n "${INPUT_FROM}" ]; then ARGS="${ARGS} --from ${INPUT_FROM}"; fi
+          if [ -n "${INPUT_TO}" ]; then ARGS="${ARGS} --to ${INPUT_TO}"; fi
+
+          DOTENV_CONFIG_PATH=.env.development node --env-file=.env.development scripts/sync-adblue.mjs ${ARGS} 2>&1 | tee /tmp/sync-adblue.log
+
+          SUMMARY=$(grep "^::SUMMARY_JSON::" /tmp/sync-adblue.log | tail -1 | sed 's/^::SUMMARY_JSON:://' || echo '{}')
+          echo "SYNC_ADBLUE_JSON<<SUMMARY_EOF" >> $GITHUB_ENV
+          echo "${SUMMARY}" >> $GITHUB_ENV
+          echo "SUMMARY_EOF" >> $GITHUB_ENV
+
+      - name: Clean up env file
+        if: always()
+        run: rm -f .env.development
+
+      - name: Summary
+        if: always()
+        env:
+          SYNC_ADBLUE_JSON: ${{ env.SYNC_ADBLUE_JSON }}
+          FECHA_MX: ${{ env.FECHA_MX }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          if [ "$JOB_STATUS" = "success" ]; then
+            echo "### ✅ Sync AdBlue DEV completado" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ❌ Sync AdBlue DEV falló" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Fecha:** ${FECHA_MX}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          node <<'NODE_EOF' >> $GITHUB_STEP_SUMMARY
+          const safeParse = (raw) => { try { return JSON.parse(raw || "{}"); } catch { return {}; } };
+          const r = safeParse(process.env.SYNC_ADBLUE_JSON);
+
+          const out = [];
+          out.push("#### Resumen");
+          if (r.script) {
+            out.push(`_Tiempo: ${r.elapsed_seconds ?? "?"}s_`);
+            out.push("");
+            out.push("| Rango | Días | Cargas API | Insertadas | Duplicadas | Errores |");
+            out.push("|---|---:|---:|---:|---:|---:|");
+            out.push(`| ${r.from ?? "-"} → ${r.to ?? "-"} | ${r.days ?? 0} | ${r.fetched ?? 0} | ${r.inserted ?? 0} | ${r.skipped ?? 0} | ${r.errors ?? 0} |`);
+            if (r.unmatched && r.unmatched.length) {
+              out.push("");
+              out.push(`⚠️ **Unidades sin match (${r.unmatched.length}):** ${r.unmatched.join(", ")}`);
+            }
+          } else {
+            out.push("_Sin datos_");
+          }
+          out.push("");
+
+          console.log(out.join("\n"));
+          NODE_EOF

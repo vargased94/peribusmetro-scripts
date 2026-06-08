@@ -40,8 +40,11 @@ const SITIO = process.env.TOTHEM_SITIO || "130";
 const CONCURRENCY = Number(process.env.SYNC_TANKS_CONCURRENCY || 3);
 
 // Reintentos para errores transitorios del API
-const MAX_RETRIES = 3;
-const RETRY_BASE_MS = 1000; // 1s, 2s, 4s
+const MAX_RETRIES = Number(process.env.SYNC_TANKS_MAX_RETRIES || 3);
+const RETRY_BASE_MS = Number(process.env.SYNC_TANKS_RETRY_BASE_MS || 1000);
+
+// Pequeña pausa entre días para no saturar el API en runs largos
+const PER_DAY_DELAY_MS = Number(process.env.SYNC_TANKS_PER_DAY_DELAY_MS || 0);
 
 // Tamaño máximo de filas por INSERT (chunk del pooler)
 const INSERT_CHUNK = 500;
@@ -468,10 +471,12 @@ async function main() {
       logInfo(
         `  ${r.date}  fetched=${r.fetched}  valid=${r.valid}  inserted=${r.inserted}  skipped=${r.skipped}`
       );
+      if (PER_DAY_DELAY_MS > 0) await sleep(PER_DAY_DELAY_MS);
       return r;
     } catch (err) {
       const msg = err?.message || String(err);
       logError(`  ${day}  ERROR: ${msg}`);
+      if (PER_DAY_DELAY_MS > 0) await sleep(PER_DAY_DELAY_MS);
       return { date: day, error: msg };
     }
   });

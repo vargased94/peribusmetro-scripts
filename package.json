@@ -13,6 +13,8 @@
     "autolink:prod": "DOTENV_CONFIG_PATH=.env.production node --env-file=.env.production scripts/comercial-auto-link.mjs",
     "sync:tanks:dev": "DOTENV_CONFIG_PATH=.env.development node --env-file=.env.development scripts/sync-tank-monitoring.mjs",
     "sync:tanks:prod": "DOTENV_CONFIG_PATH=.env.production node --env-file=.env.production scripts/sync-tank-monitoring.mjs",
+    "sync:adblue:dev": "DOTENV_CONFIG_PATH=.env.development node --env-file=.env.development scripts/sync-adblue.mjs",
+    "sync:adblue:prod": "DOTENV_CONFIG_PATH=.env.production node --env-file=.env.production scripts/sync-adblue.mjs",
     "backup:prod-to-dev": "./scripts/backup-prod-to-dev.sh"
   },
   "dependencies": {
