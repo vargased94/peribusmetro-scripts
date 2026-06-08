@@ -142,16 +142,20 @@ jobs:
         if: ${{ github.event.inputs.skip_restore != 'true' }}
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL_DEV }}
+          PGOPTIONS: "-c statement_timeout=0 -c idle_in_transaction_session_timeout=0"
         run: |
           echo "::group::Restaurando income_transactions desde CSV filtrado..."
           psql "$DATABASE_URL" -c "ALTER TABLE income_transactions DISABLE TRIGGER ALL;" 2>&1 || true
 
+          START_TS=$(date +%s)
           gunzip -c "${BACKUP_FILE_LARGE}" \
-            | psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+            | psql "$DATABASE_URL" -v ON_ERROR_STOP=1 --single-transaction \
               -c "\COPY income_transactions FROM STDIN WITH (FORMAT csv, HEADER true)" 2>&1 || {
                 echo "::warning::income_transactions restore falló."
                 echo "INCOME_RESTORE_FAILED=true" >> $GITHUB_ENV
               }
+          END_TS=$(date +%s)
+          echo "COPY duró $((END_TS - START_TS)) segundos"
 
           psql "$DATABASE_URL" -c "ALTER TABLE income_transactions ENABLE TRIGGER ALL;" 2>&1 || true
           psql "$DATABASE_URL" -c "SELECT setval(pg_get_serial_sequence('income_transactions', 'id'), COALESCE(MAX(id), 1)) FROM income_transactions;" 2>&1 || true
@@ -210,6 +214,11 @@ jobs:
           fi
           if [ "${UNIDADES}" = "0" ] || [ -z "${UNIDADES}" ]; then
             echo "::error::La tabla units está vacía después de la restauración."
+            exit 1
+          fi
+
+          if [ "${INCOME_RESTORE_FAILED}" = "true" ]; then
+            echo "::error::La restauración de income_transactions falló en Fase 3 (revisar logs)."
             exit 1
           fi
 
