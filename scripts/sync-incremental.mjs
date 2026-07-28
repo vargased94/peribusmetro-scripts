@@ -269,7 +269,12 @@ function buildUpdateSet(columnMap, uniqueKey) {
   return Object.values(columnMap)
     .filter((col) => col !== uniqueKey)
     .map((col) => `${col} = EXCLUDED.${col}`)
-    .concat(["synced_at = EXCLUDED.synced_at"])
+    .concat([
+      "synced_at = EXCLUDED.synced_at",
+      // Si el registro reaparece en el ERP (o fue desactivado por error),
+      // vuelve a quedar activo: el ERP es la fuente de la verdad.
+      "active = 1",
+    ])
     .join(",\n            ");
 }
 
@@ -280,10 +285,56 @@ async function getExistingIds(target, uniqueKey) {
   return new Set(rows.map((r) => r[uniqueKey]));
 }
 
+/**
+ * Desactiva los registros que ya NO existen en el ERP.
+ *
+ * AdminPAQ permite BORRAR documentos físicamente (no solo cancelarlos). Como el
+ * sync solo hace INSERT/UPDATE, esos registros quedaban vivos en Supabase para
+ * siempre — "fantasmas" que siguen sumando en los reportes de gasto aunque en
+ * el ERP ya no existan.
+ *
+ * No se borran aquí: se marcan `active = 0` para conservar el histórico y no
+ * romper los vínculos con folios de mantenimiento/accidente.
+ */
+async function deactivateMissing(target, uniqueKey, erpIds) {
+  const rows = await supabase.unsafe(
+    `SELECT ${uniqueKey} FROM ${target} WHERE active = 1`
+  );
+
+  const ghosts = rows
+    .map((r) => Number(r[uniqueKey]))
+    .filter((id) => !erpIds.has(id));
+
+  if (ghosts.length === 0) return { deactivated: 0, ghostIds: [] };
+
+  const CHUNK = 500;
+  for (let i = 0; i < ghosts.length; i += CHUNK) {
+    const slice = ghosts.slice(i, i + CHUNK);
+    await supabase.unsafe(
+      `UPDATE ${target} SET active = 0 WHERE ${uniqueKey} = ANY($1::bigint[])`,
+      [slice]
+    );
+  }
+
+  return { deactivated: ghosts.length, ghostIds: ghosts };
+}
+
 async function getLastTimestamp(target) {
   try {
+    // OJO: sql_timestamp es TEXTO con formato MM/DD/YYYY, así que un MAX()
+    // directo compara alfabéticamente y devuelve el mes más alto, no la fecha
+    // más reciente (ej. "12/31/2025" ganaba sobre "07/28/2026" — 7 meses de
+    // atraso). Hay que ordenar por la fecha convertida.
     const result = await supabase.unsafe(
-      `SELECT COALESCE(MAX(sql_timestamp), '') as last_ts FROM ${target} WHERE sql_timestamp IS NOT NULL AND sql_timestamp != '' AND sql_timestamp != '12/30/1899 00:00:00:000'`
+      `SELECT COALESCE(
+         (SELECT sql_timestamp FROM ${target}
+           WHERE sql_timestamp IS NOT NULL
+             AND sql_timestamp != ''
+             AND sql_timestamp != '12/30/1899 00:00:00:000'
+             AND sql_timestamp ~ '^[0-9]{2}/[0-9]{2}/[0-9]{4}'
+           ORDER BY TO_TIMESTAMP(SUBSTRING(sql_timestamp FROM 1 FOR 19), 'MM/DD/YYYY HH24:MI:SS') DESC
+           LIMIT 1),
+         '') as last_ts`
     );
     return result[0].last_ts;
   } catch {
@@ -371,6 +422,7 @@ async function syncTable(pool, tableDef) {
   let totalUpdated = 0;
   let totalErrors = 0;
   let totalMissing = 0;
+  let totalDeactivated = 0;
 
   // 1) Obtener todos los IDs de SQL Server y Supabase para encontrar faltantes
   console.log(`  Comparando IDs entre SQL Server y Supabase...`);
@@ -382,6 +434,21 @@ async function syncTable(pool, tableDef) {
     .query(`SELECT ${sourceKey} FROM ${name}`);
   const allSqlIds = allSqlResult.recordset.map((r) => r[sourceKey]);
   console.log(`  IDs en SQL Server: ${allSqlIds.length}`);
+
+  // Registros borrados del ERP → marcar active = 0 (ver deactivateMissing)
+  const erpIds = new Set(allSqlIds.map((id) => Number(id)));
+  const { deactivated, ghostIds } = await deactivateMissing(
+    target,
+    uniqueKey,
+    erpIds
+  );
+  totalDeactivated = deactivated;
+  if (deactivated > 0) {
+    console.log(
+      `  Borrados en el ERP → desactivados: ${deactivated}` +
+        ` (ids: ${ghostIds.slice(0, 10).join(", ")}${ghostIds.length > 10 ? ", ..." : ""})`
+    );
+  }
 
   // Encontrar IDs faltantes en Supabase
   const missingIds = allSqlIds.filter((id) => !existingIds.has(id));
@@ -438,7 +505,7 @@ async function syncTable(pool, tableDef) {
     }
   }
 
-  const total = totalInserted + totalUpdated;
+  const total = totalInserted + totalUpdated + totalDeactivated;
   if (total === 0 && totalErrors === 0) {
     console.log(`  ✓ Sin cambios`);
   }
@@ -448,6 +515,7 @@ async function syncTable(pool, tableDef) {
     missing: totalMissing,
     inserted: totalInserted,
     updated: totalUpdated,
+    deactivated: totalDeactivated,
     errors: totalErrors,
   };
 }
@@ -498,6 +566,7 @@ async function main() {
       Faltantes: r.missing,
       Insertados: r.inserted,
       Actualizados: r.updated,
+      Desactivados: r.deactivated,
       Errores: r.errors,
     }))
   );
@@ -509,9 +578,10 @@ async function main() {
       missing: acc.missing + (r.missing ?? 0),
       inserted: acc.inserted + (r.inserted ?? 0),
       updated: acc.updated + (r.updated ?? 0),
+      deactivated: acc.deactivated + (r.deactivated ?? 0),
       errors: acc.errors + (r.errors ?? 0),
     }),
-    { missing: 0, inserted: 0, updated: 0, errors: 0 }
+    { missing: 0, inserted: 0, updated: 0, deactivated: 0, errors: 0 }
   );
   const summary = {
     script: "sync-incremental",
@@ -521,6 +591,7 @@ async function main() {
       missing: r.missing ?? 0,
       inserted: r.inserted ?? 0,
       updated: r.updated ?? 0,
+      deactivated: r.deactivated ?? 0,
       errors: r.errors ?? 0,
     })),
     totals,
