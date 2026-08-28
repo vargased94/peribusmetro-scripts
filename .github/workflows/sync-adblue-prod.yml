@@ -3,12 +3,12 @@ name: "Sync AdBlue (PROD)"
 # Sincroniza las cargas de AdBlue/Urea desde la API Piusi B.Smart hacia la tabla
 # `supramax_diesel_charges` (provider = 'BSMART') en Supabase PROD.
 #
-# - Schedule: diario 03:00 AM hora de Guadalajara (CST/UTC-6 = 09:00 UTC)
+# - Schedule: diario 03:23 AM hora de Guadalajara (CST/UTC-6 = 09:23 UTC)
 # - Manual: workflow_dispatch con inputs `from`/`to` para backfill.
 
 on:
   schedule:
-    - cron: "0 9 * * *"
+    - cron: "23 9 * * *"
   workflow_dispatch:
     inputs:
       from:

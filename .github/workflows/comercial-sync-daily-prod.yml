@@ -2,7 +2,7 @@ name: "Comercial Sync Daily (PROD)"
 
 on:
   schedule:
-    - cron: "0 11 * * *"  # Diario 05:00 AM hora de México (CST/UTC-6 = 11:00 UTC)
+    - cron: "37 11 * * *"  # Diario 05:37 AM hora de México (CST/UTC-6 = 11:37 UTC). Minuto fuera de pico para reducir retrasos de GitHub Actions.
   workflow_dispatch:
 
 env:
