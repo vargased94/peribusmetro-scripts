@@ -2,7 +2,7 @@ name: "Backup PROD to DEV"
 
 on:
   schedule:
-    - cron: "0 8 * * *"  # Diario 02:00 AM hora de México (CST/UTC-6 = 08:00 UTC)
+    - cron: "17 8 * * *"  # Diario 02:17 AM hora de México (CST/UTC-6 = 08:17 UTC). Minuto fuera de pico para reducir retrasos de GitHub Actions.
   workflow_dispatch:
     inputs:
       skip_restore:

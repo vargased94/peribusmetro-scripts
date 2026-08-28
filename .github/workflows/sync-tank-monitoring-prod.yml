@@ -3,12 +3,12 @@ name: "Sync Tank Monitoring (PROD)"
 # Sincroniza lecturas del API Tothem (sitio 130 - monitoreo) hacia
 # la tabla `diesel_tank_monitoring` en Supabase PROD.
 #
-# - Schedule: diario 05:00 AM hora de México (CST/UTC-6 = 11:00 UTC)
+# - Schedule: diario 05:43 AM hora de México (CST/UTC-6 = 11:43 UTC)
 # - Manual: workflow_dispatch con inputs `from`/`to` para backfill.
 
 on:
   schedule:
-    - cron: "0 11 * * *"
+    - cron: "43 11 * * *"
   workflow_dispatch:
 
 env:
